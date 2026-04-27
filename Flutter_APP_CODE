@@ -1,0 +1,1732 @@
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:http/http.dart' as http;
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
+import 'dart:async';
+
+// ==================== THINGSPEAK CONFIG ====================
+class ThingSpeakConfig {
+  static const String channelId  = '3339084';
+  static const String readApiKey = 'ADDGSHMU6DBRW70I';
+}
+
+// ==================== THINGSPEAK SERVICE ====================
+class ThingSpeakService {
+  static const String _base = 'https://api.thingspeak.com';
+
+  static Future<Map<String, dynamic>?> getLastFeed() async {
+    try {
+      final url = '$_base/channels/${ThingSpeakConfig.channelId}'
+          '/feeds/last.json?api_key=${ThingSpeakConfig.readApiKey}';
+      final r = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 6));
+      if (r.statusCode == 200) return jsonDecode(r.body);
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<List<Map<String, dynamic>>> getFeeds({int results = 20}) async {
+    try {
+      final url = '$_base/channels/${ThingSpeakConfig.channelId}'
+          '/feeds.json?api_key=${ThingSpeakConfig.readApiKey}&results=$results';
+      final r = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 8));
+      if (r.statusCode == 200) {
+        final data = jsonDecode(r.body);
+        return List<Map<String, dynamic>>.from(data['feeds'] ?? []);
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  static Map<String, dynamic> parseFeed(Map<String, dynamic> feed) {
+    return {
+      'temp':     double.tryParse(feed['field1'] ?? '') ?? 0.0,
+      'humidity': double.tryParse(feed['field2'] ?? '') ?? 0.0,
+      'soil':     int.tryParse(feed['field3'] ?? '') ?? 0,
+      'pump':     (feed['field4'] ?? '0') == '1',
+      'time':     feed['created_at'] ?? '',
+    };
+  }
+}
+
+// ==================== MAIN ====================
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.init();
+  SystemChrome.setSystemUIOverlayStyle(
+    const SystemUiOverlayStyle(statusBarColor: Colors.transparent),
+  );
+  runApp(const SmartDropApp());
+}
+
+// ==================== APP ====================
+class SmartDropApp extends StatelessWidget {
+  const SmartDropApp({super.key});
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'SmartDrop',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF2E7D32),
+          brightness: Brightness.light,
+        ),
+        useMaterial3: true,
+        scaffoldBackgroundColor: const Color(0xFFF5F5F5),
+      ),
+      home: const SplashScreen(),
+    );
+  }
+}
+
+PageRouteBuilder _fadeRoute(Widget page) {
+  return PageRouteBuilder(
+    pageBuilder: (_, __, ___) => page,
+    transitionsBuilder: (_, a, __, c) => FadeTransition(opacity: a, child: c),
+    transitionDuration: const Duration(milliseconds: 800),
+  );
+}
+
+// ==================== NOTIFICATIONS ====================
+class NotificationService {
+  static final _plugin = FlutterLocalNotificationsPlugin();
+  static bool _initialized    = false;
+  static bool _soilAlertSent  = false;
+  static bool _disconnectSent = false;
+  static bool _dhtAlertSent   = false;
+
+  static Future<void> init() async {
+    if (_initialized) return;
+    const android = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const ios = DarwinInitializationSettings(
+      requestAlertPermission: true,
+      requestBadgePermission: true,
+      requestSoundPermission: true,
+    );
+    await _plugin.initialize(const InitializationSettings(android: android, iOS: ios));
+    await _plugin
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()
+        ?.requestNotificationsPermission();
+    _initialized = true;
+  }
+
+  static Future<void> _send(int id, String title, String body) async {
+    await _plugin.show(id, title, body,
+      const NotificationDetails(
+        android: AndroidNotificationDetails(
+          'smartdrop_channel', 'SmartDrop تنبيهات',
+          channelDescription: 'تنبيهات نظام الري الذكي',
+          importance: Importance.high,
+          priority: Priority.high,
+          icon: '@mipmap/ic_launcher',
+        ),
+        iOS: DarwinNotificationDetails(presentAlert: true, presentSound: true),
+      ),
+    );
+  }
+
+  static Future<void> checkAndNotify({
+    required bool connected,
+    required bool soilConnected,
+    required int soilMoisture,
+    required bool dhtConnected,
+    required double temp,
+  }) async {
+    if (!connected) {
+      if (!_disconnectSent) {
+        _disconnectSent = true;
+        await _send(1, '⚠️ SmartDrop غير متصل', 'تم فقدان الاتصال بالجهاز');
+      }
+      return;
+    }
+    _disconnectSent = false;
+
+    if (soilConnected && soilMoisture < 30) {
+      if (!_soilAlertSent) {
+        _soilAlertSent = true;
+        await _send(2, '💧 التربة جافة!', 'رطوبة التربة $soilMoisture% — يحتاج ري الآن');
+      }
+    } else {
+      _soilAlertSent = false;
+    }
+
+    if (dhtConnected && temp > 40) {
+      if (!_dhtAlertSent) {
+        _dhtAlertSent = true;
+        await _send(3, '🌡️ حرارة عالية!', 'درجة الحرارة ${temp.toStringAsFixed(1)}°C — تحقق من النبات');
+      }
+    } else {
+      _dhtAlertSent = false;
+    }
+  }
+
+  static void resetAll() {
+    _soilAlertSent = _disconnectSent = _dhtAlertSent = false;
+  }
+}
+
+// ==================== SPLASH ====================
+class SplashScreen extends StatefulWidget {
+  const SplashScreen({super.key});
+  @override
+  State<SplashScreen> createState() => _SplashScreenState();
+}
+
+class _SplashScreenState extends State<SplashScreen> with TickerProviderStateMixin {
+  late AnimationController _ctrl;
+  late Animation<double> _fade, _scale;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(seconds: 2));
+    _fade  = Tween<double>(begin: 0, end: 1).animate(_ctrl);
+    _scale = Tween<double>(begin: 0.3, end: 1).animate(
+        CurvedAnimation(parent: _ctrl, curve: Curves.elasticOut));
+    _ctrl.forward();
+    Future.delayed(const Duration(seconds: 3), () {
+      if (!mounted) return;
+      Navigator.pushReplacement(context, _fadeRoute(const ConnectScreen()));
+    });
+  }
+
+  @override
+  void dispose() { _ctrl.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF111111),
+      body: Center(
+        child: FadeTransition(
+          opacity: _fade,
+          child: ScaleTransition(
+            scale: _scale,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  width: 140, height: 140,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: const Color(0xFF2E7D32),
+                    boxShadow: [BoxShadow(
+                      color: const Color(0xFF4CAF50).withValues(alpha: 0.4),
+                      blurRadius: 40, spreadRadius: 10,
+                    )],
+                  ),
+                  child: const Icon(Icons.water_drop_rounded, size: 70, color: Colors.white),
+                ),
+                const SizedBox(height: 25),
+                const Text('SmartDrop', style: TextStyle(
+                    fontSize: 36, fontWeight: FontWeight.bold,
+                    color: Colors.white, letterSpacing: 2)),
+                const SizedBox(height: 8),
+                const Text('نظام الري الذكي',
+                    style: TextStyle(fontSize: 16, color: Color(0xFF81C784))),
+                const SizedBox(height: 10),
+                const Text('© 2025 أحمد بشرى أحمد يوسف',
+                    style: TextStyle(fontSize: 12, color: Colors.grey)),
+                const SizedBox(height: 50),
+                const SizedBox(
+                  width: 200,
+                  child: LinearProgressIndicator(
+                    backgroundColor: Colors.white12,
+                    color: Color(0xFF4CAF50),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== CONNECT SCREEN ====================
+class ConnectScreen extends StatefulWidget {
+  const ConnectScreen({super.key});
+  @override
+  State<ConnectScreen> createState() => _ConnectScreenState();
+}
+
+class _ConnectScreenState extends State<ConnectScreen> with TickerProviderStateMixin {
+  late AnimationController _ctrl;
+  int _tab = 0;
+  bool scanning = false;
+  List<Map<String, dynamic>> wifiDevices = [];
+  List<BluetoothDevice> bleDevices = [];
+  String status = 'اضغط للبحث';
+  final TextEditingController _ipCtrl = TextEditingController();
+  String manualIP = '';
+  StreamSubscription? _bleScan;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(seconds: 2))..repeat();
+    _requestPermissions();
+  }
+
+  @override
+  void dispose() { _ctrl.dispose(); _bleScan?.cancel(); super.dispose(); }
+
+  Future<void> _requestPermissions() async {
+    await [
+      Permission.bluetooth,
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+      Permission.location,
+    ].request();
+  }
+
+  Future<void> scanWiFi() async {
+    setState(() { scanning = true; wifiDevices.clear(); status = 'جاري البحث...'; });
+
+    // محاولة mDNS أولاً
+    final mdnsHosts = ['smartdrop.local', 'smartdrop-1.local', 'smartdrop-2.local'];
+    for (final host in mdnsHosts) {
+      try {
+        final r = await http.get(Uri.parse('http://$host/discover'))
+            .timeout(const Duration(seconds: 2));
+        if (r.statusCode == 200) {
+          final d = jsonDecode(r.body);
+          if (d['type'] == 'SmartDrop' && mounted) {
+            setState(() => wifiDevices.add({'ip': host, 'name': d['device']}));
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (wifiDevices.isNotEmpty) {
+      if (mounted) setState(() { scanning = false; status = 'تم العثور على ${wifiDevices.length} جهاز'; });
+      return;
+    }
+
+    // مسح الشبكة بـ batches أكبر وأسرع
+    if (mounted) setState(() => status = 'جاري مسح الشبكة...');
+    final ranges = ['192.168.1', '192.168.0', '192.168.4', '10.0.0', '10.68.0', '172.16.0'];
+
+    for (final range in ranges) {
+      if (wifiDevices.isNotEmpty) break;
+      final futures = <Future>[];
+      for (int i = 1; i <= 254; i++) {
+        final ip = '$range.$i';
+        futures.add(
+          http.get(Uri.parse('http://$ip/discover'))
+              .timeout(const Duration(milliseconds: 200))  // ← 200ms أسرع
+              .then((r) {
+                if (r.statusCode == 200) {
+                  final d = jsonDecode(r.body);
+                  if (d['type'] == 'SmartDrop' && mounted) {
+                    setState(() => wifiDevices.add({'ip': ip, 'name': d['device']}));
+                  }
+                }
+              }).catchError((_) {}),
+        );
+        if (futures.length >= 50) {  // ← 50 بدل 20 — أسرع
+          await Future.wait(futures);
+          futures.clear();
+        }
+      }
+      if (futures.isNotEmpty) await Future.wait(futures);
+    }
+
+    if (mounted) setState(() {
+      scanning = false;
+      status = wifiDevices.isEmpty ? 'لم يتم العثور على أجهزة' : 'تم العثور على ${wifiDevices.length} جهاز';
+    });
+  }
+
+  Future<void> scanBLE() async {
+    setState(() { scanning = true; bleDevices.clear(); status = 'جاري البحث عن أجهزة BLE...'; });
+
+    final adapterState = await FlutterBluePlus.adapterState.first;
+    if (adapterState != BluetoothAdapterState.on) {
+      if (mounted) setState(() { scanning = false; status = 'يرجى تفعيل البلوتوث أولاً'; });
+      return;
+    }
+
+    _bleScan?.cancel();
+    await FlutterBluePlus.stopScan();
+
+    _bleScan = FlutterBluePlus.onScanResults.listen((results) {
+      for (var r in results) {
+        final name = r.device.platformName;
+        if (name.isNotEmpty &&
+            name.contains('SmartDrop') &&
+            !bleDevices.any((d) => d.remoteId == r.device.remoteId) &&
+            mounted) {
+          setState(() => bleDevices.add(r.device));
+        }
+      }
+    });
+
+    await FlutterBluePlus.startScan(
+      timeout: const Duration(seconds: 10),
+      androidUsesFineLocation: true,
+    );
+
+    if (mounted) setState(() {
+      scanning = false;
+      status = bleDevices.isEmpty ? 'لم يتم العثور على أجهزة BLE' : 'تم العثور على ${bleDevices.length} جهاز';
+    });
+  }
+
+  Future<void> connectWiFiManual() async {
+    if (manualIP.isEmpty) return;
+    try {
+      final r = await http.get(Uri.parse('http://$manualIP/discover'))
+          .timeout(const Duration(seconds: 5));
+      if (r.statusCode == 200) {
+        final d = jsonDecode(r.body);
+        if (d['type'] == 'SmartDrop') {
+          _goToMain(ip: manualIP, name: d['device']);
+        } else {
+          _showError('الجهاز ليس SmartDrop');
+        }
+      }
+    } catch (_) {
+      _showError('لا يمكن الاتصال بالجهاز');
+    }
+  }
+
+  void _showError(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg), backgroundColor: Colors.red,
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+    ));
+  }
+
+  void _goToMain({String? ip, String? name, BluetoothDevice? bleDevice}) {
+    Navigator.pushReplacement(context, _fadeRoute(MainScreen(
+      ip: ip, deviceName: name ?? 'SmartDrop', bleDevice: bleDevice,
+    )));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF111111),
+      body: SafeArea(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SizedBox(height: 20),
+              Row(children: [
+                Container(
+                  width: 40, height: 40,
+                  decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFF2E7D32)),
+                  child: const Icon(Icons.water_drop_rounded, size: 20, color: Colors.white),
+                ),
+                const SizedBox(width: 10),
+                const Text('SmartDrop', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.white)),
+              ]),
+              const SizedBox(height: 30),
+              const Text('اتصل بجهازك', style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold, color: Colors.white)),
+              const SizedBox(height: 20),
+              Container(
+                padding: const EdgeInsets.all(4),
+                decoration: BoxDecoration(color: const Color(0xFF222222), borderRadius: BorderRadius.circular(15)),
+                child: Row(children: [
+                  _buildTab(0, Icons.wifi, 'WiFi'),
+                  _buildTab(1, Icons.bluetooth, 'Bluetooth'),
+                ]),
+              ),
+              const SizedBox(height: 20),
+              if (_tab == 0) ...[
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF222222),
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(color: const Color(0xFF4CAF50).withValues(alpha: 0.3)),
+                  ),
+                  child: Row(children: [
+                    const Icon(Icons.wifi, color: Color(0xFF4CAF50), size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(child: TextField(
+                      controller: _ipCtrl,
+                      style: const TextStyle(color: Colors.white),
+                      decoration: const InputDecoration(
+                        hintText: 'أدخل IP يدوياً أو smartdrop.local',
+                        hintStyle: TextStyle(color: Colors.grey),
+                        border: InputBorder.none,
+                      ),
+                      onChanged: (v) => manualIP = v,
+                    )),
+                    GestureDetector(
+                      onTap: connectWiFiManual,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 8),
+                        decoration: BoxDecoration(color: const Color(0xFF2E7D32), borderRadius: BorderRadius.circular(10)),
+                        child: const Text('اتصال', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      ),
+                    ),
+                  ]),
+                ),
+                const SizedBox(height: 20),
+              ],
+              Center(
+                child: GestureDetector(
+                  onTap: scanning ? null : (_tab == 0 ? scanWiFi : scanBLE),
+                  child: AnimatedBuilder(
+                    animation: _ctrl,
+                    builder: (_, __) => Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        if (scanning) ...[
+                          Container(
+                            width: 160 + _ctrl.value * 50, height: 160 + _ctrl.value * 50,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: const Color(0xFF4CAF50).withValues(alpha: 1 - _ctrl.value), width: 2),
+                            ),
+                          ),
+                          Container(
+                            width: 130 + _ctrl.value * 50, height: 130 + _ctrl.value * 50,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: const Color(0xFF4CAF50).withValues(alpha: 0.5 - _ctrl.value * 0.5), width: 1),
+                            ),
+                          ),
+                        ],
+                        Container(
+                          width: 100, height: 100,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: const Color(0xFF2E7D32),
+                            boxShadow: [BoxShadow(color: const Color(0xFF4CAF50).withValues(alpha: 0.4), blurRadius: 20)],
+                          ),
+                          child: Icon(
+                            scanning ? Icons.wifi_find : (_tab == 0 ? Icons.wifi : Icons.bluetooth),
+                            size: 40, color: Colors.white,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 15),
+              Center(child: Text(status, style: const TextStyle(color: Colors.grey, fontSize: 14))),
+              const SizedBox(height: 20),
+              if (_tab == 0)
+                ...wifiDevices.map((d) => GestureDetector(
+                  onTap: () => _goToMain(ip: d['ip'], name: d['name']),
+                  child: _DeviceCard(name: d['name'], subtitle: d['ip'], icon: Icons.wifi),
+                )),
+              if (_tab == 1)
+                ...bleDevices.map((d) => GestureDetector(
+                  onTap: () => _goToMain(bleDevice: d, name: d.platformName),
+                  child: _DeviceCard(name: d.platformName, subtitle: d.remoteId.toString(), icon: Icons.bluetooth),
+                )),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTab(int index, IconData icon, String label) {
+    final active = _tab == index;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _tab = index),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            color: active ? const Color(0xFF2E7D32) : Colors.transparent,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(icon, color: active ? Colors.white : Colors.grey, size: 18),
+            const SizedBox(width: 8),
+            Text(label, style: TextStyle(color: active ? Colors.white : Colors.grey, fontWeight: FontWeight.bold)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+class _DeviceCard extends StatelessWidget {
+  final String name, subtitle;
+  final IconData icon;
+  const _DeviceCard({required this.name, required this.subtitle, required this.icon});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: const Color(0xFF222222),
+        borderRadius: BorderRadius.circular(15),
+        border: Border.all(color: const Color(0xFF4CAF50).withValues(alpha: 0.4)),
+      ),
+      child: Row(children: [
+        Container(
+          width: 50, height: 50,
+          decoration: BoxDecoration(shape: BoxShape.circle, color: const Color(0xFF2E7D32).withValues(alpha: 0.2)),
+          child: Icon(icon, color: const Color(0xFF4CAF50)),
+        ),
+        const SizedBox(width: 15),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16)),
+          Text(subtitle, style: const TextStyle(color: Colors.grey, fontSize: 12)),
+        ])),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+          decoration: BoxDecoration(color: const Color(0xFF2E7D32).withValues(alpha: 0.2), borderRadius: BorderRadius.circular(10)),
+          child: const Text('اتصال', style: TextStyle(color: Color(0xFF4CAF50), fontSize: 12)),
+        ),
+      ]),
+    );
+  }
+}
+
+// ==================== MAIN SCREEN ====================
+class MainScreen extends StatefulWidget {
+  final String? ip;
+  final String deviceName;
+  final BluetoothDevice? bleDevice;
+  const MainScreen({super.key, this.ip, required this.deviceName, this.bleDevice});
+  @override
+  State<MainScreen> createState() => _MainScreenState();
+}
+
+class _MainScreenState extends State<MainScreen> {
+  int _index = 0;
+  bool pumpStatus    = false;
+  bool pumpConnected = true;
+  int soilMoisture   = 0;
+  bool soilConnected = false;
+  double temp        = 0;
+  double humidity    = 0;
+  bool dhtConnected  = false;
+  bool connected     = false;
+  int waterCount     = 0;
+  double totalWaterTime = 0;
+  Timer? timer;
+  List<Map<String, dynamic>> logs = [];
+  String secretKey  = '';
+  bool _keyEntered  = false;
+  bool isBLE        = false;
+
+  BluetoothCharacteristic? _bleChar;
+  StreamSubscription? _bleNotifySub;
+  StreamSubscription? _bleStatesSub;
+  Completer<String>? _pendingResponse;
+
+  List<Map<String, dynamic>> _tsHistory = [];
+  bool _tsLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    isBLE = widget.bleDevice != null;
+    if (isBLE) {
+      _connectBLE();
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _loadSavedData());
+    }
+  }
+
+  Future<void> _loadSavedData() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('secret_key_${widget.ip}') ?? '';
+    if (saved.isNotEmpty) {
+      secretKey   = saved;
+      _keyEntered = true;
+      _startPolling();
+    } else {
+      _showKeyDialog();
+    }
+  }
+
+  Future<void> _saveKey(String key) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('secret_key_${widget.ip}', key);
+  }
+
+  Future<void> _clearKey() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('secret_key_${widget.ip}');
+  }
+
+  void _startPolling() {
+    timer?.cancel();
+    timer = Timer.periodic(const Duration(seconds: 3), (_) => getStatus());
+    getStatus();
+  }
+
+  void _showKeyDialog() {
+    String key = '';
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF222222),
+        title: const Text('كلمة السر', style: TextStyle(color: Colors.white)),
+        content: TextField(
+          style: const TextStyle(color: Colors.white),
+          obscureText: true,
+          decoration: const InputDecoration(
+            hintText: 'أدخل كلمة السر (اتركه فارغاً إن لم يكن)',
+            hintStyle: TextStyle(color: Colors.grey),
+            border: OutlineInputBorder(),
+          ),
+          onChanged: (v) => key = v,
+        ),
+        actions: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF2E7D32)),
+            onPressed: () {
+              secretKey   = key;
+              _keyEntered = true;
+              Navigator.pop(context);
+              _saveKey(key);
+              _startPolling();
+            },
+            child: const Text('دخول', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ==================== BLE ====================
+  Future<void> _connectBLE() async {
+    if (widget.bleDevice == null) return;
+    final device = widget.bleDevice!;
+
+    _bleStatesSub = device.connectionState.listen((state) async {
+      if (state == BluetoothConnectionState.disconnected && mounted) {
+        setState(() => connected = false);
+        await Future.delayed(const Duration(seconds: 3));
+        if (mounted) _connectBLE();
+      }
+    });
+
+    try {
+      await device.connect(timeout: const Duration(seconds: 10), autoConnect: false);
+    } catch (e) {
+      if (!mounted) return;
+      if (!e.toString().contains('already')) {
+        setState(() => connected = false);
+        _showSnack('❌ فشل الاتصال بـ Bluetooth', Colors.red);
+        return;
+      }
+    }
+
+    try {
+      final services = await device.discoverServices();
+      BluetoothCharacteristic? found;
+
+      for (var s in services) {
+        if (!s.serviceUuid.toString().toLowerCase().contains('12345678')) continue;
+        for (var c in s.characteristics) {
+          if (c.characteristicUuid.toString().toLowerCase().contains('abcdefab')) {
+            found = c;
+            break;
+          }
+        }
+        if (found != null) break;
+      }
+
+      if (found == null) {
+        if (!mounted) return;
+        setState(() => connected = false);
+        _showSnack('❌ Characteristic غير موجود', Colors.red);
+        return;
+      }
+
+      _bleChar = found;
+      await _bleChar!.setNotifyValue(true);
+
+      _bleNotifySub = _bleChar!.onValueReceived.listen((data) {
+        if (data.isEmpty) return;
+        final str = utf8.decode(data);
+        if (_pendingResponse != null && !_pendingResponse!.isCompleted) {
+          _pendingResponse!.complete(str);
+        }
+      });
+
+      if (!mounted) return;
+      setState(() => connected = true);
+      timer?.cancel();
+      timer = Timer.periodic(const Duration(seconds: 3), (_) => getStatus());
+      getStatus();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => connected = false);
+      _showSnack('❌ خطأ: $e', Colors.red);
+    }
+  }
+
+  Future<String?> _bleSendAndWait(String cmd, {Duration timeout = const Duration(seconds: 5)}) async {
+    if (_bleChar == null || !connected) return null;
+    try {
+      _pendingResponse = Completer<String>();
+      final payload = jsonEncode({'cmd': cmd, 'key': secretKey});
+      await _bleChar!.write(utf8.encode(payload), withoutResponse: false);
+      final response = await _pendingResponse!.future.timeout(timeout);
+      _pendingResponse = null;
+      return response;
+    } on TimeoutException {
+      _pendingResponse = null;
+      return null;
+    } catch (_) {
+      _pendingResponse = null;
+      return null;
+    }
+  }
+
+  Map<String, String> _getHeaders() =>
+      {'X-Secret-Key': secretKey, 'Content-Type': 'application/json'};
+
+  Future<void> getStatus() async {
+    if (!isBLE) {
+      if (!_keyEntered) return;
+      try {
+        final r = await http.get(Uri.parse('http://${widget.ip}/status'), headers: _getHeaders())
+            .timeout(const Duration(seconds: 3));
+        if (!mounted) return;
+        if (r.statusCode == 200) {
+          _parseStatusJson(jsonDecode(r.body));
+        } else if (r.statusCode == 401) {
+          await _clearKey();
+          _showSnack('كلمة السر غلط', Colors.red);
+          _showKeyDialog();
+        }
+      } catch (_) {
+        if (!mounted) return;
+        setState(() => connected = false);
+        NotificationService.checkAndNotify(connected: false, soilConnected: false, soilMoisture: 0, dhtConnected: false, temp: 0);
+      }
+      return;
+    }
+
+    if (_bleChar == null) return;
+    final response = await _bleSendAndWait('status');
+    if (!mounted) return;
+    if (response == null) {
+      setState(() => connected = false);
+      NotificationService.checkAndNotify(connected: false, soilConnected: false, soilMoisture: 0, dhtConnected: false, temp: 0);
+      return;
+    }
+    try {
+      final d = jsonDecode(response) as Map<String, dynamic>;
+      if (d['error'] == 'unauthorized') {
+        _showSnack('كلمة السر غلط', Colors.red);
+        _showKeyDialog();
+        return;
+      }
+      _parseStatusJson(d);
+    } catch (_) {}
+  }
+
+  void _parseStatusJson(Map<String, dynamic> d) {
+    if (!mounted) return;
+    setState(() {
+      pumpStatus     = d['pump'] == 1;
+      pumpConnected  = d['pumpConnected'] ?? true;
+      soilMoisture   = d['soil'] ?? 0;
+      soilConnected  = d['soilConnected'] ?? false;
+      temp           = (d['temp'] ?? 0).toDouble();
+      humidity       = (d['humidity'] ?? 0).toDouble();
+      dhtConnected   = d['dhtConnected'] ?? false;
+      waterCount     = d['waterCount'] ?? 0;
+      totalWaterTime = (d['totalWaterTime'] ?? 0).toDouble();
+      connected      = true;
+    });
+    NotificationService.checkAndNotify(
+      connected: true, soilConnected: soilConnected,
+      soilMoisture: soilMoisture, dhtConnected: dhtConnected, temp: temp,
+    );
+  }
+
+  Future<void> pumpOn() async {
+    if (!connected) { _showSnack('⚠️ الجهاز غير متصل', Colors.orange); return; }
+    try {
+      if (isBLE) {
+        final r = await _bleSendAndWait('pump_on');
+        if (!mounted) return;
+        if (r != null) setState(() => pumpStatus = true);
+      } else {
+        final r = await http.get(Uri.parse('http://${widget.ip}/pump/on'), headers: _getHeaders());
+        if (!mounted) return;
+        if (r.statusCode == 200) { setState(() => pumpStatus = true); }
+        else if (r.statusCode == 401) { await _clearKey(); _showSnack('كلمة السر غلط', Colors.red); _showKeyDialog(); return; }
+      }
+      addLog('تشغيل المضخة يدوياً');
+      _showSnack('✅ تم تشغيل المضخة', const Color(0xFF4CAF50));
+    } catch (_) { _showSnack('❌ فشل الاتصال', Colors.red); }
+  }
+
+  Future<void> pumpOff() async {
+    if (!connected) { _showSnack('⚠️ الجهاز غير متصل', Colors.orange); return; }
+    try {
+      if (isBLE) {
+        final r = await _bleSendAndWait('pump_off');
+        if (!mounted) return;
+        if (r != null) setState(() => pumpStatus = false);
+      } else {
+        final r = await http.get(Uri.parse('http://${widget.ip}/pump/off'), headers: _getHeaders());
+        if (!mounted) return;
+        if (r.statusCode == 200) { setState(() => pumpStatus = false); }
+        else if (r.statusCode == 401) { await _clearKey(); _showSnack('كلمة السر غلط', Colors.red); _showKeyDialog(); return; }
+      }
+      addLog('إيقاف المضخة يدوياً');
+      _showSnack('⛔ تم إيقاف المضخة', Colors.orange);
+    } catch (_) { _showSnack('❌ فشل الاتصال', Colors.red); }
+  }
+
+  Future<void> autoWater() async {
+    if (!connected) { _showSnack('⚠️ الجهاز غير متصل', Colors.orange); return; }
+    try {
+      String status = 'notneed';
+      if (isBLE) {
+        final r = await _bleSendAndWait('auto', timeout: const Duration(seconds: 10));
+        if (!mounted) return;
+        if (r != null) status = (jsonDecode(r))['status'] ?? 'notneed';
+      } else {
+        final r = await http.get(Uri.parse('http://${widget.ip}/auto'), headers: _getHeaders());
+        if (!mounted) return;
+        status = jsonDecode(r.body)['status'] ?? 'notneed';
+      }
+      final msg = status == 'watered' ? '💧 تم الري التلقائي' : '✅ التربة رطبة';
+      addLog(msg);
+      _showSnack(msg, const Color(0xFF4CAF50));
+      getStatus();
+    } catch (_) { _showSnack('❌ فشل الاتصال', Colors.red); }
+  }
+
+  Future<void> loadThingSpeakHistory() async {
+    setState(() => _tsLoading = true);
+    try {
+      final feeds = await ThingSpeakService.getFeeds(results: 20);
+      if (!mounted) return;
+      setState(() {
+        _tsHistory = feeds.map(ThingSpeakService.parseFeed).toList();
+        _tsLoading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _tsLoading = false);
+      _showSnack('❌ خطأ ThingSpeak: $e', Colors.red);
+    }
+  }
+
+  void addLog(String msg) {
+    if (!mounted) return;
+    setState(() {
+      final now = DateTime.now();
+      logs.insert(0, {
+        'message': msg,
+        'time': '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}',
+        'date': '${now.day}/${now.month}/${now.year}',
+      });
+      if (logs.length > 100) logs.removeLast();
+    });
+  }
+
+  void _showSnack(String msg, Color color) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg), backgroundColor: color,
+      behavior: SnackBarBehavior.floating,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+    ));
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    _bleNotifySub?.cancel();
+    _bleStatesSub?.cancel();
+    _pendingResponse = null;
+    widget.bleDevice?.disconnect();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final pages = [
+      _DashboardPage(
+        deviceName: widget.deviceName, ip: widget.ip ?? 'BLE',
+        pumpStatus: pumpStatus, pumpConnected: pumpConnected,
+        soilMoisture: soilMoisture, soilConnected: soilConnected,
+        temp: temp, humidity: humidity, dhtConnected: dhtConnected,
+        connected: connected, waterCount: waterCount,
+        totalWaterTime: totalWaterTime, isBLE: isBLE,
+        onPumpOn: pumpOn, onPumpOff: pumpOff, onAutoWater: autoWater,
+      ),
+      _ThingSpeakPage(
+        channelId: ThingSpeakConfig.channelId,
+        history: _tsHistory,
+        loading: _tsLoading,
+        onRefresh: loadThingSpeakHistory,
+      ),
+      _LogsPage(logs: logs),
+      _SettingsPage(
+        ip: widget.ip ?? 'BLE',
+        deviceName: widget.deviceName,
+        onChangeKey: () async {
+          await _clearKey();
+          NotificationService.resetAll();
+          if (!mounted) return;
+          Navigator.pushReplacement(context,
+              MaterialPageRoute(builder: (_) => MainScreen(ip: widget.ip, deviceName: widget.deviceName)));
+        },
+      ),
+    ];
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F5F5),
+      body: pages[_index],
+      bottomNavigationBar: Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          border: Border(top: BorderSide(color: Color(0xFFE8E8E8), width: 0.5)),
+        ),
+        child: BottomNavigationBar(
+          currentIndex: _index,
+          onTap: (i) {
+            setState(() => _index = i);
+            if (i == 1) loadThingSpeakHistory();
+          },
+          backgroundColor: Colors.transparent,
+          selectedItemColor: const Color(0xFF2E7D32),
+          unselectedItemColor: Colors.grey,
+          type: BottomNavigationBarType.fixed,
+          elevation: 0,
+          items: const [
+            BottomNavigationBarItem(icon: Icon(Icons.dashboard_rounded), label: 'الرئيسية'),
+            BottomNavigationBarItem(icon: Icon(Icons.cloud_rounded),     label: 'ThingSpeak'),
+            BottomNavigationBarItem(icon: Icon(Icons.history_rounded),   label: 'السجل'),
+            BottomNavigationBarItem(icon: Icon(Icons.settings_rounded),  label: 'الإعدادات'),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== DISCONNECTED BANNER ====================
+class _DisconnectedBanner extends StatefulWidget {
+  const _DisconnectedBanner();
+  @override
+  State<_DisconnectedBanner> createState() => _DisconnectedBannerState();
+}
+
+class _DisconnectedBannerState extends State<_DisconnectedBanner> with SingleTickerProviderStateMixin {
+  late AnimationController _c;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 900))..repeat();
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+      padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+      decoration: BoxDecoration(
+        color: Colors.red.shade50,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.red.shade200),
+      ),
+      child: Row(children: [
+        const Icon(Icons.wifi_off_rounded, color: Colors.red, size: 20),
+        const SizedBox(width: 10),
+        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('غير متصل بالجهاز', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold, fontSize: 13)),
+          Text('جاري إعادة المحاولة...', style: TextStyle(color: Colors.red.shade400, fontSize: 11)),
+        ]),
+        const Spacer(),
+        AnimatedBuilder(animation: _c, builder: (_, __) {
+          return Row(children: List.generate(3, (i) {
+            final val = ((_c.value - i * 0.33) % 1.0).clamp(0.0, 1.0);
+            final op  = (val < 0.5 ? val * 2 : (1 - val) * 2).clamp(0.2, 1.0);
+            return Container(
+              margin: const EdgeInsets.symmetric(horizontal: 2),
+              width: 6, height: 6,
+              decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.red.withValues(alpha: op)),
+            );
+          }));
+        }),
+      ]),
+    );
+  }
+}
+
+// ==================== ANIMATED ICONS ====================
+class _AnimatedTempIcon extends StatefulWidget {
+  final bool active;
+  const _AnimatedTempIcon({required this.active});
+  @override
+  State<_AnimatedTempIcon> createState() => _AnimatedTempIconState();
+}
+
+class _AnimatedTempIconState extends State<_AnimatedTempIcon> with SingleTickerProviderStateMixin {
+  late AnimationController _c;
+  late Animation<double> _scale;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1200));
+    _scale = Tween<double>(begin: 1.0, end: 1.3).animate(CurvedAnimation(parent: _c, curve: Curves.easeInOut));
+    if (widget.active) _c.repeat(reverse: true);
+  }
+  @override
+  void didUpdateWidget(_AnimatedTempIcon old) {
+    super.didUpdateWidget(old);
+    widget.active ? _c.repeat(reverse: true) : (_c..stop()..value = 0);
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return ScaleTransition(
+      scale: _scale,
+      child: Icon(Icons.thermostat_rounded, color: widget.active ? Colors.orange : Colors.grey, size: 20),
+    );
+  }
+}
+
+class _AnimatedHumidityIcon extends StatefulWidget {
+  final bool active;
+  const _AnimatedHumidityIcon({required this.active});
+  @override
+  State<_AnimatedHumidityIcon> createState() => _AnimatedHumidityIconState();
+}
+
+class _AnimatedHumidityIconState extends State<_AnimatedHumidityIcon> with SingleTickerProviderStateMixin {
+  late AnimationController _c;
+  late Animation<double> _slide;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1000));
+    _slide = Tween<double>(begin: 0, end: -4).animate(CurvedAnimation(parent: _c, curve: Curves.easeInOut));
+    if (widget.active) _c.repeat(reverse: true);
+  }
+  @override
+  void didUpdateWidget(_AnimatedHumidityIcon old) {
+    super.didUpdateWidget(old);
+    widget.active ? _c.repeat(reverse: true) : (_c..stop()..value = 0);
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _slide,
+      builder: (_, __) => Transform.translate(
+        offset: Offset(0, _slide.value),
+        child: Icon(Icons.water_rounded, color: widget.active ? const Color(0xFF1565C0) : Colors.grey, size: 20),
+      ),
+    );
+  }
+}
+
+class _PumpRipple extends StatefulWidget {
+  final bool active;
+  const _PumpRipple({required this.active});
+  @override
+  State<_PumpRipple> createState() => _PumpRippleState();
+}
+
+class _PumpRippleState extends State<_PumpRipple> with SingleTickerProviderStateMixin {
+  late AnimationController _c;
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400));
+    if (widget.active) _c.repeat();
+  }
+  @override
+  void didUpdateWidget(_PumpRipple old) {
+    super.didUpdateWidget(old);
+    widget.active ? _c.repeat() : (_c..stop()..value = 0);
+  }
+  @override
+  void dispose() { _c.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(animation: _c, builder: (_, __) {
+      return Stack(alignment: Alignment.center, children: [
+        if (widget.active) ...[
+          Container(
+            width: 44 + _c.value * 28, height: 44 + _c.value * 28,
+            decoration: BoxDecoration(shape: BoxShape.circle,
+                border: Border.all(color: const Color(0xFF43A047).withValues(alpha: 1 - _c.value), width: 1.5)),
+          ),
+          Container(
+            width: 44 + _c.value * 14, height: 44 + _c.value * 14,
+            decoration: BoxDecoration(shape: BoxShape.circle,
+                border: Border.all(color: const Color(0xFF43A047).withValues(alpha: (1 - _c.value) * 0.5), width: 1)),
+          ),
+        ],
+        Container(
+          width: 44, height: 44,
+          decoration: BoxDecoration(shape: BoxShape.circle,
+              color: widget.active ? const Color(0xFFE8F5E9) : const Color(0xFFF5F5F5)),
+          child: Icon(Icons.water_drop_rounded,
+              color: widget.active ? const Color(0xFF2E7D32) : Colors.grey, size: 24),
+        ),
+      ]);
+    });
+  }
+}
+
+// ==================== DASHBOARD ====================
+class _DashboardPage extends StatelessWidget {
+  final String deviceName, ip;
+  final bool pumpStatus, pumpConnected, soilConnected, dhtConnected, connected, isBLE;
+  final int soilMoisture, waterCount;
+  final double temp, humidity, totalWaterTime;
+  final VoidCallback onPumpOn, onPumpOff, onAutoWater;
+
+  const _DashboardPage({
+    required this.deviceName, required this.ip,
+    required this.pumpStatus, required this.pumpConnected,
+    required this.soilMoisture, required this.soilConnected,
+    required this.temp, required this.humidity,
+    required this.dhtConnected, required this.connected,
+    required this.waterCount, required this.totalWaterTime,
+    required this.isBLE, required this.onPumpOn,
+    required this.onPumpOff, required this.onAutoWater,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: SingleChildScrollView(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Container(
+            color: Colors.white,
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+            child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+              Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(deviceName, style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF111111))),
+                Row(children: [
+                  Icon(isBLE ? Icons.bluetooth : Icons.wifi, size: 11, color: Colors.grey),
+                  const SizedBox(width: 4),
+                  Text(ip, style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                ]),
+              ]),
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 400),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: connected ? const Color(0xFFE8F5E9) : const Color(0xFFFFEBEE),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: connected ? const Color(0xFFA5D6A7) : const Color(0xFFFFCDD2)),
+                ),
+                child: Row(children: [
+                  AnimatedContainer(
+                    duration: const Duration(milliseconds: 400),
+                    width: 7, height: 7,
+                    decoration: BoxDecoration(shape: BoxShape.circle, color: connected ? const Color(0xFF43A047) : Colors.red),
+                  ),
+                  const SizedBox(width: 5),
+                  Text(connected ? 'متصل' : 'غير متصل',
+                      style: TextStyle(color: connected ? const Color(0xFF2E7D32) : Colors.red, fontSize: 12, fontWeight: FontWeight.w500)),
+                ]),
+              ),
+            ]),
+          ),
+          if (!connected) const _DisconnectedBanner(),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(children: [
+              _LightCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                  const Text('رطوبة التربة', style: TextStyle(color: Colors.grey, fontSize: 13)),
+                  Row(children: [
+                    _statusBadge(soilConnected),
+                    const SizedBox(width: 8),
+                    Icon(Icons.grass_rounded, color: soilMoisture < 30 ? Colors.red : const Color(0xFF43A047), size: 20),
+                  ]),
+                ]),
+                const SizedBox(height: 8),
+                Text(
+                  connected && soilConnected ? '$soilMoisture%' : '—',
+                  style: TextStyle(
+                    fontSize: 42, fontWeight: FontWeight.bold,
+                    color: !connected || !soilConnected ? Colors.grey : soilMoisture < 30 ? Colors.red : const Color(0xFF111111),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                if (connected && soilConnected) ...[
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(8),
+                    child: LinearProgressIndicator(
+                      value: soilMoisture / 100,
+                      backgroundColor: const Color(0xFFEEEEEE),
+                      color: soilMoisture < 30 ? Colors.red : const Color(0xFF43A047),
+                      minHeight: 7,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    soilMoisture < 30 ? '⚠️ التربة جافة — يحتاج ري' : '✅ الرطوبة مناسبة',
+                    style: TextStyle(color: soilMoisture < 30 ? Colors.red : Colors.grey, fontSize: 12),
+                  ),
+                ] else if (!connected)
+                  const Text('لا تتوفر بيانات — الجهاز غير متصل', style: TextStyle(color: Colors.grey, fontSize: 12))
+                else
+                  const Text('⚠️ الحساس غير متصل', style: TextStyle(color: Colors.orange, fontSize: 12)),
+              ])),
+              const SizedBox(height: 10),
+              Row(children: [
+                Expanded(child: _LightCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Row(children: [
+                      _AnimatedTempIcon(active: connected && dhtConnected),
+                      const SizedBox(width: 6),
+                      const Text('الحرارة', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                    ]),
+                    _statusBadge(dhtConnected),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text(
+                    connected && dhtConnected ? '${temp.toStringAsFixed(1)}°C' : '—',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold,
+                        color: connected && dhtConnected ? const Color(0xFF111111) : Colors.grey),
+                  ),
+                ]))),
+                const SizedBox(width: 10),
+                Expanded(child: _LightCard(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                    Row(children: [
+                      _AnimatedHumidityIcon(active: connected && dhtConnected),
+                      const SizedBox(width: 6),
+                      const Text('الرطوبة', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                    ]),
+                    _statusBadge(dhtConnected),
+                  ]),
+                  const SizedBox(height: 8),
+                  Text(
+                    connected && dhtConnected ? '${humidity.toStringAsFixed(1)}%' : '—',
+                    style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold,
+                        color: connected && dhtConnected ? const Color(0xFF111111) : Colors.grey),
+                  ),
+                ]))),
+              ]),
+              const SizedBox(height: 10),
+              _LightCard(child: Row(children: [
+                _PumpRipple(active: connected && pumpStatus && pumpConnected),
+                const SizedBox(width: 14),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('المضخة', style: TextStyle(color: Color(0xFF111111), fontSize: 15, fontWeight: FontWeight.bold)),
+                  Text(
+                    !connected ? 'الجهاز غير متصل' : !pumpConnected ? '⚠️ غير متصلة' : pumpStatus ? 'تعمل الآن' : 'متوقفة',
+                    style: TextStyle(
+                      color: !connected || !pumpConnected ? Colors.grey : pumpStatus ? const Color(0xFF43A047) : Colors.grey,
+                      fontSize: 13,
+                    ),
+                  ),
+                ]),
+                const Spacer(),
+                Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                  Text('$waterCount مرة', style: const TextStyle(color: Colors.grey, fontSize: 12)),
+                  Text('${totalWaterTime.toStringAsFixed(0)} ث', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                ]),
+              ])),
+              const SizedBox(height: 16),
+              Row(children: [
+                Expanded(child: _ActionBtn(icon: Icons.play_circle_rounded, label: 'تشغيل', color: const Color(0xFF43A047), onTap: onPumpOn)),
+                const SizedBox(width: 10),
+                Expanded(child: _ActionBtn(icon: Icons.stop_circle_rounded, label: 'إيقاف', color: Colors.red, onTap: onPumpOff)),
+              ]),
+              const SizedBox(height: 10),
+              _ActionBtn(icon: Icons.autorenew_rounded, label: 'ري تلقائي ذكي', color: const Color(0xFF2E7D32), onTap: onAutoWater, fullWidth: true),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  static Widget _statusBadge(bool ok) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+      decoration: BoxDecoration(
+        color: ok ? const Color(0xFFE8F5E9) : const Color(0xFFFFEBEE),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Text(ok ? 'متصل' : 'غير متصل',
+          style: TextStyle(color: ok ? const Color(0xFF2E7D32) : Colors.red, fontSize: 10, fontWeight: FontWeight.w500)),
+    );
+  }
+}
+
+// ==================== THINGSPEAK PAGE ====================
+class _ThingSpeakPage extends StatelessWidget {
+  final String channelId;
+  final List<Map<String, dynamic>> history;
+  final bool loading;
+  final VoidCallback onRefresh;
+
+  const _ThingSpeakPage({
+    required this.channelId, required this.history,
+    required this.loading, required this.onRefresh,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Container(
+          color: Colors.white,
+          padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
+          child: Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+            const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('سجل ThingSpeak', style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF111111))),
+              Text('آخر 20 قراءة من السحابة', style: TextStyle(fontSize: 12, color: Colors.grey)),
+            ]),
+            GestureDetector(
+              onTap: onRefresh,
+              child: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(10)),
+                child: loading
+                    ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF2E7D32)))
+                    : const Icon(Icons.refresh_rounded, color: Color(0xFF2E7D32), size: 22),
+              ),
+            ),
+          ]),
+        ),
+        Expanded(
+          child: history.isEmpty
+              ? Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                  loading
+                      ? const CircularProgressIndicator(color: Color(0xFF2E7D32))
+                      : Icon(Icons.cloud_rounded, size: 80, color: Colors.grey[300]),
+                  const SizedBox(height: 15),
+                  Text(loading ? 'جاري التحميل...' : 'اضغط تحديث لتحميل البيانات',
+                      style: const TextStyle(color: Colors.grey)),
+                ]))
+              : ListView.builder(
+                  padding: const EdgeInsets.all(16),
+                  itemCount: history.length,
+                  itemBuilder: (_, i) {
+                    final item = history[i];
+                    String displayTime = item['time'] as String;
+                    try {
+                      final dt = DateTime.parse(displayTime).toLocal();
+                      displayTime = '${dt.day}/${dt.month} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+                    } catch (_) {}
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 10),
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: const Color(0xFFE8E8E8), width: 0.5),
+                      ),
+                      child: Row(children: [
+                        Container(
+                          width: 40, height: 40,
+                          decoration: BoxDecoration(shape: BoxShape.circle, color: const Color(0xFF2E7D32).withValues(alpha: 0.1)),
+                          child: const Icon(Icons.cloud_done_rounded, color: Color(0xFF2E7D32), size: 20),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text(displayTime, style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                          const SizedBox(height: 4),
+                          Wrap(spacing: 8, runSpacing: 4, children: [
+                            _tsChip('🌡️ ${(item['temp'] as double).toStringAsFixed(1)}°C', Colors.orange),
+                            _tsChip('💧 ${(item['humidity'] as double).toStringAsFixed(1)}%', Colors.blue),
+                            _tsChip('🌱 ${item['soil']}%', Colors.green),
+                            _tsChip(item['pump'] ? '⚡ مضخة شغالة' : '⭕ مضخة متوقفة', item['pump'] ? Colors.green : Colors.grey),
+                          ]),
+                        ])),
+                      ]),
+                    );
+                  },
+                ),
+        ),
+      ]),
+    );
+  }
+
+  static Widget _tsChip(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.3)),
+      ),
+      child: Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w500)),
+    );
+  }
+}
+
+// ==================== SHARED WIDGETS ====================
+class _LightCard extends StatelessWidget {
+  final Widget child;
+  const _LightCard({required this.child});
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: const Color(0xFFE8E8E8), width: 0.5),
+      ),
+      child: child,
+    );
+  }
+}
+
+class _ActionBtn extends StatefulWidget {
+  final IconData icon;
+  final String label;
+  final Color color;
+  final VoidCallback onTap;
+  final bool fullWidth;
+  const _ActionBtn({required this.icon, required this.label, required this.color, required this.onTap, this.fullWidth = false});
+  @override
+  State<_ActionBtn> createState() => _ActionBtnState();
+}
+
+class _ActionBtnState extends State<_ActionBtn> with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 150), lowerBound: 0.95, upperBound: 1.0, value: 1.0);
+  }
+  @override
+  void dispose() { _ctrl.dispose(); super.dispose(); }
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: (_) => _ctrl.reverse(),
+      onTapUp: (_) { _ctrl.forward(); widget.onTap(); },
+      onTapCancel: () => _ctrl.forward(),
+      child: ScaleTransition(
+        scale: _ctrl,
+        child: Container(
+          width: widget.fullWidth ? double.infinity : null,
+          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 20),
+          decoration: BoxDecoration(
+            color: widget.color.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: widget.color.withValues(alpha: 0.4)),
+          ),
+          child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+            Icon(widget.icon, color: widget.color, size: 22),
+            const SizedBox(width: 8),
+            Text(widget.label, style: TextStyle(color: widget.color, fontWeight: FontWeight.bold, fontSize: 14)),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== LOGS ====================
+class _LogsPage extends StatelessWidget {
+  final List<Map<String, dynamic>> logs;
+  const _LogsPage({required this.logs});
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('سجل العمليات', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF111111))),
+          const SizedBox(height: 20),
+          logs.isEmpty
+              ? Center(child: Column(children: [
+                  const SizedBox(height: 100),
+                  Icon(Icons.history_rounded, size: 80, color: Colors.grey[300]),
+                  const SizedBox(height: 15),
+                  const Text('لا يوجد سجل بعد', style: TextStyle(color: Colors.grey)),
+                ]))
+              : Expanded(child: ListView.builder(
+                  itemCount: logs.length,
+                  itemBuilder: (_, i) => Container(
+                    margin: const EdgeInsets.only(bottom: 10),
+                    padding: const EdgeInsets.all(15),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(14),
+                      border: Border.all(color: const Color(0xFFE8E8E8), width: 0.5),
+                    ),
+                    child: Row(children: [
+                      Container(
+                        width: 40, height: 40,
+                        decoration: const BoxDecoration(shape: BoxShape.circle, color: Color(0xFFE8F5E9)),
+                        child: const Icon(Icons.water_drop_rounded, color: Color(0xFF2E7D32), size: 20),
+                      ),
+                      const SizedBox(width: 15),
+                      Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text(logs[i]['message'], style: const TextStyle(color: Color(0xFF111111), fontSize: 14)),
+                        Text('${logs[i]['date']} - ${logs[i]['time']}', style: const TextStyle(color: Colors.grey, fontSize: 11)),
+                      ])),
+                    ]),
+                  ),
+                )),
+        ]),
+      ),
+    );
+  }
+}
+
+// ==================== SETTINGS ====================
+class _SettingsPage extends StatelessWidget {
+  final String ip, deviceName;
+  final VoidCallback onChangeKey;
+  const _SettingsPage({required this.ip, required this.deviceName, required this.onChangeKey});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('الإعدادات', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Color(0xFF111111))),
+          const SizedBox(height: 20),
+          _SettingItem(icon: Icons.device_hub, title: 'اسم الجهاز', subtitle: deviceName, color: const Color(0xFF2E7D32)),
+          _SettingItem(icon: Icons.wifi, title: 'عنوان IP', subtitle: ip, color: Colors.teal),
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white, borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFFE8E8E8), width: 0.5),
+            ),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                Container(
+                  width: 36, height: 36,
+                  decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.teal.withValues(alpha: 0.1)),
+                  child: const Icon(Icons.cloud_rounded, color: Colors.teal, size: 18),
+                ),
+                const SizedBox(width: 10),
+                const Text('ThingSpeak', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF111111))),
+              ]),
+              const SizedBox(height: 12),
+              Row(children: [
+                const Icon(Icons.tag, color: Colors.grey, size: 14),
+                const SizedBox(width: 6),
+                const Text('Channel ID: ', style: TextStyle(color: Colors.grey, fontSize: 12)),
+                Text(ThingSpeakConfig.channelId,
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF2E7D32))),
+              ]),
+              const SizedBox(height: 6),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(color: const Color(0xFFE8F5E9), borderRadius: BorderRadius.circular(8)),
+                child: const Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Row(children: [
+                    Icon(Icons.developer_board, size: 14, color: Color(0xFF2E7D32)),
+                    SizedBox(width: 6),
+                    Text('ESP32 ← يرسل البيانات إلى ThingSpeak', style: TextStyle(fontSize: 11, color: Color(0xFF2E7D32))),
+                  ]),
+                  SizedBox(height: 4),
+                  Row(children: [
+                    Icon(Icons.phone_android, size: 14, color: Color(0xFF2E7D32)),
+                    SizedBox(width: 6),
+                    Text('التطبيق ← يقرأ فقط من ThingSpeak', style: TextStyle(fontSize: 11, color: Color(0xFF2E7D32))),
+                  ]),
+                ]),
+              ),
+            ]),
+          ),
+          const _SettingItem(icon: Icons.info_rounded, title: 'عن التطبيق', subtitle: 'SmartDrop v2.0', color: Colors.blueGrey),
+          const _SettingItem(icon: Icons.copyright_rounded, title: 'حقوق النشر', subtitle: '© 2025 أحمد بشرى أحمد يوسف', color: Colors.grey),
+          const SizedBox(height: 20),
+          GestureDetector(
+            onTap: onChangeKey,
+            child: Container(
+              padding: const EdgeInsets.all(15),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade50, borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.orange.shade200, width: 0.5),
+              ),
+              child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(Icons.key_rounded, color: Colors.orange),
+                SizedBox(width: 10),
+                Text('تغيير كلمة السر', style: TextStyle(color: Colors.orange, fontWeight: FontWeight.bold)),
+              ]),
+            ),
+          ),
+          const SizedBox(height: 10),
+          GestureDetector(
+            onTap: () {
+              NotificationService.resetAll();
+              Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const ConnectScreen()));
+            },
+            child: Container(
+              padding: const EdgeInsets.all(15),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50, borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.red.shade200, width: 0.5),
+              ),
+              child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(Icons.logout_rounded, color: Colors.red),
+                SizedBox(width: 10),
+                Text('قطع الاتصال', style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+              ]),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class _SettingItem extends StatelessWidget {
+  final IconData icon;
+  final String title, subtitle;
+  final Color color;
+  const _SettingItem({required this.icon, required this.title, required this.subtitle, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.white, borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFE8E8E8), width: 0.5),
+      ),
+      child: Row(children: [
+        Container(
+          width: 40, height: 40,
+          decoration: BoxDecoration(shape: BoxShape.circle, color: color.withValues(alpha: 0.1)),
+          child: Icon(icon, color: color, size: 20),
+        ),
+        const SizedBox(width: 15),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(title, style: const TextStyle(color: Color(0xFF111111), fontWeight: FontWeight.bold)),
+          Text(subtitle, style: const TextStyle(color: Colors.grey, fontSize: 12)),
+        ])),
+        const Icon(Icons.arrow_forward_ios, color: Colors.grey, size: 14),
+      ]),
+    );
+  }
+}
