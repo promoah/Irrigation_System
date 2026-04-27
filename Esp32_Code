@@ -1,0 +1,448 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <Preferences.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HTTPClient.h>
+#include "esp_wifi.h"
+
+#define PUMP_PIN   26
+#define SOIL_PIN   34
+#define DHT_PIN    4
+#define DHT_TYPE   DHT11
+
+#define WIFI_SSID  "But a wifi ssid"
+#define WIFI_PASS  "but password here"
+
+#define TS_WRITE_KEY  "PLUWZ7GWBR09K5IS"
+#define TS_URL        "http://api.thingspeak.com/update"
+#define TS_INTERVAL   15000UL
+
+#define BLE_SERVICE_UUID        "12345678-1234-1234-1234-123456789abc"
+#define BLE_CHARACTERISTIC_UUID "abcdefab-cdef-abcd-efab-cdefabcdefab"
+
+#define DEVICE_NAME   "SmartDrop-1"
+#define SECRET_KEY    ""
+#define AUTO_INTERVAL 10000UL
+#define PUMP_DURATION 5000UL
+#define DRY_THRESHOLD 40
+
+DHT        dht(DHT_PIN, DHT_TYPE);
+WebServer  server(80);
+Preferences prefs;
+
+BLEServer*         pServer         = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool               bleConnected    = false;
+
+bool   pumpState      = false;
+float  totalWaterTime = 0;
+int    waterCount     = 0;
+String deviceName     = DEVICE_NAME;
+String secretKey      = SECRET_KEY;
+bool   configured     = false;
+
+unsigned long lastAutoCheck  = 0;
+unsigned long lastThingSpeak = 0;
+
+struct SensorData {
+  float temp;
+  float humidity;
+  int   soil;
+  bool  soilOk;
+  bool  dhtOk;
+  int   soilPercent;
+};
+
+SensorData readSensors() {
+  SensorData s;
+  s.temp     = dht.readTemperature();
+  s.humidity = dht.readHumidity();
+  s.dhtOk    = !isnan(s.temp) && !isnan(s.humidity);
+  if (!s.dhtOk) { s.temp = 0; s.humidity = 0; }
+  s.soil        = analogRead(SOIL_PIN);
+  s.soilOk      = (s.soil > 0 && s.soil < 4095);
+  s.soilPercent = s.soilOk ? map(s.soil, 4095, 0, 0, 100) : 0;
+  return s;
+}
+
+String buildStatusJson(const SensorData& s) {
+  String j = "{";
+  j += "\"device\":\""       + deviceName + "\",";
+  j += "\"pump\":"           + String(pumpState ? 1 : 0) + ",";
+  j += "\"pumpConnected\":true,";
+  j += "\"soil\":"           + String(s.soilPercent) + ",";
+  j += "\"soilConnected\":"  + String(s.soilOk ? "true" : "false") + ",";
+  j += "\"temp\":"           + String(s.temp, 1) + ",";
+  j += "\"humidity\":"       + String(s.humidity, 1) + ",";
+  j += "\"dhtConnected\":"   + String(s.dhtOk ? "true" : "false") + ",";
+  j += "\"waterCount\":"     + String(waterCount) + ",";
+  j += "\"totalWaterTime\":" + String(totalWaterTime);
+  j += "}";
+  return j;
+}
+
+void sendToThingSpeak(const SensorData& s) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastThingSpeak < TS_INTERVAL) return;
+  lastThingSpeak = millis();
+
+  HTTPClient http;
+  String url = String(TS_URL)
+    + "?api_key=" + TS_WRITE_KEY
+    + "&field1="  + String(s.temp, 1)
+    + "&field2="  + String(s.humidity, 1)
+    + "&field3="  + String(s.soilPercent)
+    + "&field4="  + String(pumpState ? 1 : 0);
+
+  http.begin(url);
+  int code = http.GET();
+  http.end();
+
+  Serial.println(code > 0
+    ? "ThingSpeak OK code=" + String(code)
+    : "ThingSpeak ERR="     + String(code));
+}
+
+void runPump(unsigned long duration = PUMP_DURATION) {
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpState = true;
+
+  unsigned long start = millis();
+  while (millis() - start < duration) {
+    server.handleClient();
+    delay(10);
+  }
+
+  digitalWrite(PUMP_PIN, LOW);
+  pumpState = false;
+  waterCount++;
+  totalWaterTime += duration / 1000.0;
+  prefs.putInt("waterCount", waterCount);
+  prefs.putFloat("totalWater", totalWaterTime);
+}
+
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* s) override {
+    bleConnected = true;
+    Serial.println("BLE: connected");
+  }
+  void onDisconnect(BLEServer* s) override {
+    bleConnected = false;
+    Serial.println("BLE: disconnected - restarting advertising");
+    delay(500);
+    s->startAdvertising();
+  }
+};
+
+class MyCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pC) override {
+    String value = pC->getValue().c_str();
+    if (value.isEmpty()) return;
+
+    Serial.println("BLE RX: " + value);
+
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, value);
+    if (err) {
+      _reply(pC, "{\"error\":\"bad_json\"}");
+      return;
+    }
+
+    if (secretKey != "") {
+      String k = doc["key"].as<String>();
+      if (k != secretKey) {
+        _reply(pC, "{\"error\":\"unauthorized\"}");
+        return;
+      }
+    }
+
+    String cmd = doc["cmd"].as<String>();
+    Serial.println("BLE CMD: " + cmd);
+
+    if (cmd == "pump_on") {
+      digitalWrite(PUMP_PIN, HIGH);
+      pumpState = true;
+      _reply(pC, "{\"status\":\"on\"}");
+    }
+    else if (cmd == "pump_off") {
+      digitalWrite(PUMP_PIN, LOW);
+      pumpState = false;
+      _reply(pC, "{\"status\":\"off\"}");
+    }
+    else if (cmd == "status") {
+      SensorData s = readSensors();
+      _reply(pC, buildStatusJson(s));
+    }
+    else if (cmd == "auto") {
+      SensorData s = readSensors();
+      if (!s.soilOk) {
+        _reply(pC, "{\"status\":\"sensor_error\"}");
+        return;
+      }
+      if (s.soilPercent < DRY_THRESHOLD) {
+        runPump();
+        _reply(pC, "{\"status\":\"watered\"}");
+      } else {
+        _reply(pC, "{\"status\":\"notneed\"}");
+      }
+    }
+    else {
+      _reply(pC, "{\"error\":\"unknown_cmd\"}");
+    }
+  }
+
+  static void _reply(BLECharacteristic* pC, const String& json) {
+    Serial.println("BLE TX: " + json);
+    pC->setValue(json.c_str());
+    pC->notify();
+  }
+};
+
+void addCORS() {
+  server.sendHeader("Access-Control-Allow-Origin",  "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Secret-Key");
+}
+
+bool checkAuth() {
+  if (secretKey == "") return true;
+  return server.header("X-Secret-Key") == secretKey;
+}
+
+void handleDiscover() {
+  addCORS();
+  String j = "{";
+  j += "\"device\":\""   + deviceName + "\",";
+  j += "\"type\":\"SmartDrop\",";
+  j += "\"version\":\"2.0\",";
+  j += "\"ip\":\""       + WiFi.localIP().toString() + "\",";
+  j += "\"configured\":" + String(configured ? "true" : "false");
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
+void handleStatus() {
+  addCORS();
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
+  SensorData s = readSensors();
+  server.send(200, "application/json", buildStatusJson(s));
+}
+
+void handlePumpOn() {
+  addCORS();
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
+  digitalWrite(PUMP_PIN, HIGH);
+  pumpState = true;
+  server.send(200, "application/json", "{\"status\":\"on\"}");
+}
+
+void handlePumpOff() {
+  addCORS();
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
+  digitalWrite(PUMP_PIN, LOW);
+  pumpState = false;
+  server.send(200, "application/json", "{\"status\":\"off\"}");
+}
+
+void handleAutoWater() {
+  addCORS();
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
+  SensorData s = readSensors();
+  if (!s.soilOk) {
+    server.send(200, "application/json", "{\"status\":\"sensor_error\"}");
+    return;
+  }
+  if (s.soilPercent < DRY_THRESHOLD) {
+    runPump();
+    server.send(200, "application/json", "{\"status\":\"watered\"}");
+  } else {
+    server.send(200, "application/json", "{\"status\":\"notneed\"}");
+  }
+}
+
+void handleReset() {
+  addCORS();
+  if (!checkAuth()) { server.send(401, "application/json", "{\"error\":\"Unauthorized\"}"); return; }
+  waterCount = 0; totalWaterTime = 0;
+  prefs.putInt("waterCount", 0);
+  prefs.putFloat("totalWater", 0.0);
+  server.send(200, "application/json", "{\"status\":\"reset\"}");
+}
+
+void handleOptions() {
+  addCORS();
+  server.send(204);
+}
+
+void onWiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.println("WiFi connected: " + WiFi.localIP().toString());
+      MDNS.begin("smartdrop");
+      MDNS.addService("http", "tcp", 80);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("WiFi disconnected - reconnecting...");
+      WiFi.reconnect();
+      break;
+    default:
+      break;
+  }
+}
+
+bool connectWiFi() {
+  Serial.print("Connecting to: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.onEvent(onWiFiEvent);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 40) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    return true;
+  }
+
+  Serial.println("\nWiFi failed");
+  return false;
+}
+
+void initBLE() {
+  BLEDevice::init(deviceName.c_str());
+  BLEDevice::setMTU(512);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(BLE_SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+    BLE_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ   |
+    BLECharacteristic::PROPERTY_WRITE  |
+    BLECharacteristic::PROPERTY_NOTIFY |
+    BLECharacteristic::PROPERTY_INDICATE
+  );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new MyCharCallbacks());
+  pCharacteristic->setValue("{\"status\":\"ready\"}");
+
+  pService->start();
+
+  BLEAdvertising* pAdv = BLEDevice::getAdvertising();
+  pAdv->addServiceUUID(BLE_SERVICE_UUID);
+  pAdv->setScanResponse(true);
+  pAdv->setMinPreferred(0x06);
+  pAdv->setMinPreferred(0x12);
+
+  BLEDevice::startAdvertising();
+  Serial.println("BLE started: " + deviceName);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== SmartDrop v2.0 ===");
+
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW);
+  dht.begin();
+
+  prefs.begin("smartdrop", false);
+  waterCount     = prefs.getInt("waterCount", 0);
+  totalWaterTime = prefs.getFloat("totalWater", 0.0);
+  deviceName     = prefs.getString("deviceName", DEVICE_NAME);
+
+  bool wifiOk = connectWiFi();
+
+  if (wifiOk) {
+    server.on("/discover",  handleDiscover);
+    server.on("/status",    handleStatus);
+    server.on("/pump/on",   handlePumpOn);
+    server.on("/pump/off",  handlePumpOff);
+    server.on("/auto",      handleAutoWater);
+    server.on("/reset",     handleReset);
+
+    server.on("/discover",  HTTP_OPTIONS, handleOptions);
+    server.on("/status",    HTTP_OPTIONS, handleOptions);
+    server.on("/pump/on",   HTTP_OPTIONS, handleOptions);
+    server.on("/pump/off",  HTTP_OPTIONS, handleOptions);
+    server.on("/auto",      HTTP_OPTIONS, handleOptions);
+
+    server.begin();
+    Serial.println("Web Server started");
+    configured = true;
+
+    if (MDNS.begin("smartdrop")) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.println("mDNS: smartdrop.local");
+    }
+  } else {
+    WiFi.softAP("SmartDrop-Setup");
+    Serial.println("AP Mode: SmartDrop-Setup");
+    Serial.println("IP: " + WiFi.softAPIP().toString());
+  }
+
+  initBLE();
+
+  Serial.println("=== Device Ready ===");
+  Serial.println("WiFi: " + (wifiOk ? WiFi.localIP().toString() : "not connected"));
+  Serial.println("BLE:  " + deviceName);
+}
+
+void loop() {
+  server.handleClient();
+
+  static unsigned long wifiLostTime = 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiLostTime == 0) wifiLostTime = millis();
+    if (millis() - wifiLostTime > 30000) {
+      Serial.println("WiFi: full restart...");
+      WiFi.disconnect(true);
+      delay(1000);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      wifiLostTime = 0;
+    }
+  } else {
+    wifiLostTime = 0;
+  }
+
+  if (millis() - lastAutoCheck >= AUTO_INTERVAL) {
+    lastAutoCheck = millis();
+
+    SensorData s = readSensors();
+
+    Serial.printf("[Auto] Soil=%d%% Temp=%.1f Hum=%.1f WiFi=%s\n",
+      s.soilPercent, s.temp, s.humidity,
+      WiFi.status() == WL_CONNECTED ? "OK" : "FAIL"
+    );
+
+    if (WiFi.status() == WL_CONNECTED) {
+      sendToThingSpeak(s);
+    }
+
+    if (s.soilOk && s.soilPercent < DRY_THRESHOLD && !pumpState) {
+      Serial.println("Soil dry - auto watering");
+      runPump();
+      Serial.println("Watering done");
+    }
+  }
+}
